@@ -89,6 +89,24 @@ const CROSS_ORIGIN_FORBIDDEN_HEADERS = new Set([
   'mcp-session-id',
 ]);
 
+const HTTP_BODY_PREVIEW_MAX_CHARS = 2000;
+const HTTP_BODY_PREVIEW_TIMEOUT_MS = 1000;
+const REDACTED_HEADER_VALUE = '[redacted]';
+const SENSITIVE_HEADER_NAMES = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie',
+  'mcp-session-id',
+]);
+
+type LoggableHeaders =
+  | { entries: () => Iterable<[string, string]> }
+  | Record<string, string | undefined>
+  | [string, string][]
+  | null
+  | undefined;
+
 /**
  * Normalizes a fetch input + init pair so the redirect loop only ever has
  * to deal with `(string, init)`. When `input` is a `Request`, its method,
@@ -160,6 +178,82 @@ function normalizeInitHeaders(init: UndiciRequestInit | undefined): Record<strin
     return Object.fromEntries(init.headers);
   }
   return init.headers as Record<string, string>;
+}
+
+function shouldRedactHeader(headerName: string): boolean {
+  const lowered = headerName.toLowerCase();
+  return (
+    SENSITIVE_HEADER_NAMES.has(lowered) ||
+    lowered.includes('token') ||
+    lowered.includes('secret') ||
+    lowered.includes('api-key') ||
+    lowered.includes('apikey')
+  );
+}
+
+function normalizeHeadersForLogging(headers: LoggableHeaders): Record<string, string | undefined> {
+  if (!headers) {
+    return {};
+  }
+  if (Array.isArray(headers)) {
+    return Object.fromEntries(headers);
+  }
+  if (typeof (headers as { entries?: unknown }).entries === 'function') {
+    return Object.fromEntries(
+      (headers as { entries: () => Iterable<[string, string]> }).entries(),
+    );
+  }
+  return headers as Record<string, string | undefined>;
+}
+
+function redactHeadersForLogging(headers: LoggableHeaders): Record<string, string> {
+  const normalizedHeaders = normalizeHeadersForLogging(headers);
+  const redactedHeaders: Record<string, string> = {};
+  for (const [key, value] of Object.entries(normalizedHeaders)) {
+    redactedHeaders[key] = shouldRedactHeader(key) ? REDACTED_HEADER_VALUE : String(value ?? '');
+  }
+  return redactedHeaders;
+}
+
+function getHeaderForLogging(headers: LoggableHeaders, headerName: string): string | undefined {
+  const normalizedHeaders = normalizeHeadersForLogging(headers);
+  const entry = Object.entries(normalizedHeaders).find(
+    ([key]) => key.toLowerCase() === headerName.toLowerCase(),
+  );
+  return entry?.[1];
+}
+
+async function readResponseBodyPreview(response: UndiciResponse): Promise<string | undefined> {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.toLowerCase().includes('text/event-stream')) {
+    return '[event-stream body not read]';
+  }
+
+  try {
+    const text = await Promise.race([
+      response.clone().text(),
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve('[body read timed out]'), HTTP_BODY_PREVIEW_TIMEOUT_MS),
+      ),
+    ]);
+
+    if (text.length <= HTTP_BODY_PREVIEW_MAX_CHARS) {
+      return text;
+    }
+    return `${text.slice(0, HTTP_BODY_PREVIEW_MAX_CHARS)}... [truncated]`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `[body unavailable: ${message}]`;
+  }
+}
+
+function stringifyLogDetails(details: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(details);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return JSON.stringify({ error: `Unable to stringify log details: ${message}` });
+  }
 }
 
 function buildFetchInit(
@@ -366,6 +460,15 @@ function extractSSEErrorMessage(error: unknown): {
       code: statusCode,
       isProxyHint: statusCode === 502 || statusCode === 503 || statusCode === 504,
       isTransient: isServerError,
+    };
+  }
+
+  if (lowerMessage.includes('not acceptable')) {
+    return {
+      message: rawMessage,
+      code: 406,
+      isProxyHint: false,
+      isTransient: false,
     };
   }
 
@@ -631,6 +734,7 @@ export class MCPConnection extends EventEmitter {
       safeRedirectGetAgent ??= createSafeRedirectAgent(sseBodyTimeout);
       return safeRedirectGetAgent;
     };
+    const logPrefix = this.getLogPrefix();
 
     return async function customFetch(
       input: UndiciRequestInfo,
@@ -666,10 +770,42 @@ export class MCPConnection extends EventEmitter {
       const originalOrigin = new URL(currentUrlString).origin;
 
       for (let redirects = 0; ; redirects++) {
-        const response = await undiciFetch(currentUrlString, currentInit);
+        const method = (currentInit.method ?? 'GET').toUpperCase();
+        let response: UndiciResponse;
+        try {
+          response = await undiciFetch(currentUrlString, currentInit);
+        } catch (error) {
+          const details = {
+            method,
+            url: sanitizeUrlForLogging(currentUrlString),
+            isSseGet: method === 'GET' && sseBodyTimeout != null,
+            accept: getHeaderForLogging(currentInit.headers, 'accept'),
+            contentType: getHeaderForLogging(currentInit.headers, 'content-type'),
+            requestHeaders: redactHeadersForLogging(currentInit.headers),
+            error: error instanceof Error ? error.message : String(error),
+          };
+          logger.error(`${logPrefix} MCP HTTP fetch failed: ${stringifyLogDetails(details)}`);
+          throw error;
+        }
+
         const isMethodPreservingRedirect = response.status === 307 || response.status === 308;
 
         if (!isMethodPreservingRedirect || redirects >= MAX_REDIRECTS) {
+          if (response.status >= 400) {
+            const details = {
+              method,
+              url: sanitizeUrlForLogging(currentUrlString),
+              status: response.status,
+              statusText: response.statusText,
+              isSseGet: method === 'GET' && sseBodyTimeout != null,
+              accept: getHeaderForLogging(currentInit.headers, 'accept'),
+              contentType: getHeaderForLogging(currentInit.headers, 'content-type'),
+              requestHeaders: redactHeadersForLogging(currentInit.headers),
+              responseHeaders: redactHeadersForLogging(response.headers),
+              bodyPreview: await readResponseBodyPreview(response),
+            };
+            logger.error(`${logPrefix} MCP HTTP response error: ${stringifyLogDetails(details)}`);
+          }
           return response;
         }
 
@@ -1283,19 +1419,22 @@ export class MCPConnection extends EventEmitter {
         isTransient,
       } = extractSSEErrorMessage(error);
 
-      if (errorCode === 400 || errorCode === 404 || errorCode === 405) {
-        const hasSession =
-          'sessionId' in transport &&
-          (transport as { sessionId?: string }).sessionId != null &&
-          (transport as { sessionId?: string }).sessionId !== '';
+      const hasSession =
+        'sessionId' in transport &&
+        (transport as { sessionId?: string }).sessionId != null &&
+        (transport as { sessionId?: string }).sessionId !== '';
+      const isSseOpenFailure = errorMessage.toLowerCase().includes('failed to open sse stream');
+      const isNoSessionSseUnavailable =
+        !hasSession && isSseOpenFailure && [400, 404, 405, 406].includes(errorCode ?? 0);
 
-        if (!hasSession && errorMessage.toLowerCase().includes('failed to open sse stream')) {
-          logger.warn(
-            `${this.getLogPrefix()} SSE stream not available (${errorCode}), no session. Ignoring.`,
-          );
-          return;
-        }
+      if (isNoSessionSseUnavailable) {
+        logger.warn(
+          `${this.getLogPrefix()} SSE stream not available (${errorCode}), no session. Continuing with request/response transport.`,
+        );
+        return;
+      }
 
+      if (errorCode === 400 || errorCode === 404 || errorCode === 405 || errorCode === 406) {
         if (hasSession) {
           logger.warn(
             `${this.getLogPrefix()} ${errorCode} with active session — session lost, triggering reconnection.`,
