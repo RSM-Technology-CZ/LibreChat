@@ -1,6 +1,6 @@
 {
   "name": "@librechat/backend",
-  "version": "v0.8.6-rc1",
+  "version": "v0.8.6",
   "description": "",
   "scripts": {
     "start": "echo 'please run this from the root directory'",
@@ -46,7 +46,7 @@
     "@azure/storage-blob": "^12.30.0",
     "@google/genai": "^2.0.1",
     "@keyv/redis": "^4.3.3",
-    "@librechat/agents": "^3.1.86",
+    "@librechat/agents": "^3.2.2",
     "@librechat/api": "*",
     "@librechat/data-schemas": "*",
     "@microsoft/microsoft-graph-client": "^3.0.7",
@@ -60,7 +60,7 @@
     "@opentelemetry/instrumentation-mongoose": "^0.54.0",
     "@opentelemetry/instrumentation-undici": "^0.18.0",
     "@opentelemetry/resources": "^2.6.1",
-    "@opentelemetry/sdk-node": "^0.207.0",
+    "@opentelemetry/sdk-node": "^0.218.0",
     "@opentelemetry/semantic-conventions": "^1.39.0",
     "@smithy/node-http-handler": "^4.4.5",
     "ai-tokenizer": "^1.0.6",
@@ -131,6 +131,7 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@babel/preset-env": "^7.29.5",
     "@types/sanitize-html": "^2.13.0",
     "jest": "^30.2.0",
     "mongodb-memory-server": "^11.0.1",
